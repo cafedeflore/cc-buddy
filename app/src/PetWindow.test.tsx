@@ -5,6 +5,7 @@ import PetWindow from './PetWindow'
 import type { MonitorSnapshot, SessionRoom } from './domain/types'
 
 const startDragging = vi.fn()
+const triggerPetpet = vi.fn()
 let mockSnapshot: MonitorSnapshot = createSnapshot()
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -25,6 +26,7 @@ vi.mock('./hooks/usePetAnimation', () => ({
     videoSrc: '/idle-to-idle.webm',
     loop: true,
     handleEnded: vi.fn(),
+    triggerPetpet,
   }),
 }))
 
@@ -35,6 +37,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   startDragging.mockReset()
+  triggerPetpet.mockReset()
 })
 
 describe('PetWindow', () => {
@@ -57,10 +60,54 @@ describe('PetWindow', () => {
     expect(windowRoot).toHaveClass('pet-window--hovered')
   })
 
-  it('starts dragging when the pet stage is pressed', () => {
+  it('triggers petpet on idle click without starting drag', () => {
     render(<PetWindow />)
 
-    fireEvent.mouseDown(screen.getByTestId('pet-stage-square'), { button: 0 })
+    fireEvent.mouseDown(screen.getByTestId('pet-stage-square'), {
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    })
+    fireEvent.mouseUp(screen.getByTestId('pet-stage-square'), {
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    })
+    fireEvent.click(screen.getByTestId('pet-stage-square'))
+
+    expect(triggerPetpet).toHaveBeenCalledTimes(1)
+    expect(startDragging).not.toHaveBeenCalled()
+  })
+
+  it('does not trigger petpet when the current mood is not idle', () => {
+    mockSnapshot = createSnapshot([
+      createRoom({
+        sessionId: 'thinking-room',
+        updatedAt: '2026-04-06T00:00:10.000Z',
+        mood: 'thinking',
+        label: 'Thinking hard',
+      }),
+    ])
+
+    render(<PetWindow />)
+    fireEvent.click(screen.getByTestId('pet-stage-square'))
+
+    expect(triggerPetpet).not.toHaveBeenCalled()
+  })
+
+  it('starts dragging after pointer movement passes the threshold', () => {
+    render(<PetWindow />)
+
+    fireEvent.mouseDown(screen.getByTestId('pet-stage-square'), {
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    })
+    fireEvent.mouseMove(screen.getByTestId('pet-stage-square'), {
+      buttons: 1,
+      clientX: 24,
+      clientY: 24,
+    })
 
     expect(startDragging).toHaveBeenCalledTimes(1)
   })
@@ -104,10 +151,14 @@ function createRoom({
   sessionId = 'room-1',
   updatedAt = '2026-04-06T00:00:00.000Z',
   detail,
+  mood = 'idle',
+  label = 'Ready to help',
 }: {
   sessionId?: string
   updatedAt?: string
   detail?: string
+  mood?: SessionRoom['petState']['mood']
+  label?: string
 } = {}): SessionRoom {
   return {
     session: {
@@ -126,9 +177,9 @@ function createRoom({
         }
       : undefined,
     petState: {
-      mood: 'idle',
+      mood,
       action: 'sleeping',
-      label: 'Ready to help',
+      label,
       intensity: 'low',
     },
   }

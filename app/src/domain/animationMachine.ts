@@ -1,72 +1,113 @@
 import type { PetMood } from './types'
 
+export type AnimationClip =
+  | `${PetMood}-to-${PetMood}`
+  | 'idle-to-idle-v2'
+  | 'idle-to-idle-v3'
+  | 'idle-petpet'
+
 export interface AnimationState {
-  /** Video currently playing */
   from: PetMood
   to: PetMood
-  /** True when playing a transition (one-shot), false when looping */
+  clip: AnimationClip
+  cycle: number
   isTransition: boolean
-  /** Mood change queued while a transition is playing */
   pendingMood: PetMood | null
 }
 
-export function initialAnimationState(mood: PetMood): AnimationState {
-  return { from: mood, to: mood, isTransition: false, pendingMood: null }
+function moodClip(from: PetMood, to: PetMood): AnimationClip {
+  return `${from}-to-${to}`
 }
 
-/**
- * Called when the monitored mood changes.
- * Returns a new state, or null if nothing should change.
- */
-export function onMoodChange(state: AnimationState, newMood: PetMood): AnimationState | null {
-  const currentTarget = state.pendingMood ?? state.to
+function selectIdleLoopClip(randomValue = Math.random()): AnimationClip {
+  if (randomValue < 0.8) return 'idle-to-idle'
+  if (randomValue < 0.9) return 'idle-to-idle-v2'
+  return 'idle-to-idle-v3'
+}
 
-  // Already heading to this mood — ignore
-  if (currentTarget === newMood) return null
+export function initialAnimationState(mood: PetMood): AnimationState {
+  return {
+    from: mood,
+    to: mood,
+    clip: mood === 'idle' ? selectIdleLoopClip() : moodClip(mood, mood),
+    cycle: 0,
+    isTransition: false,
+    pendingMood: null,
+  }
+}
 
-  if (state.isTransition) {
-    // A transition is playing — queue the new mood
-    return { ...state, pendingMood: newMood }
+export function triggerIdleInteraction(state: AnimationState): AnimationState | null {
+  if (state.to !== 'idle' || state.isTransition) {
+    return null
   }
 
-  // Currently looping — start transition immediately
   return {
-    from: state.to,
-    to: newMood,
+    from: 'idle',
+    to: 'idle',
+    clip: 'idle-petpet',
+    cycle: state.cycle + 1,
     isTransition: true,
     pendingMood: null,
   }
 }
 
-/**
- * Called when the current video ends.
- * Returns the next state to play.
- */
+export function onMoodChange(state: AnimationState, newMood: PetMood): AnimationState | null {
+  const currentTarget = state.pendingMood ?? state.to
+
+  if (currentTarget === newMood) return null
+
+  if (state.isTransition) {
+    return { ...state, pendingMood: newMood }
+  }
+
+  return {
+    from: state.to,
+    to: newMood,
+    clip: moodClip(state.to, newMood),
+    cycle: state.cycle + 1,
+    isTransition: true,
+    pendingMood: null,
+  }
+}
+
 export function onVideoEnded(state: AnimationState): AnimationState {
   if (state.isTransition) {
-    // Transition finished
     if (state.pendingMood !== null) {
-      // Another mood change was queued — play that transition next
       return {
         from: state.to,
         to: state.pendingMood,
+        clip: moodClip(state.to, state.pendingMood),
+        cycle: state.cycle + 1,
         isTransition: true,
         pendingMood: null,
       }
     }
-    // No pending — start looping the destination mood
+
     return {
       from: state.to,
       to: state.to,
+      clip: state.to === 'idle' ? selectIdleLoopClip() : moodClip(state.to, state.to),
+      cycle: state.cycle + 1,
       isTransition: false,
       pendingMood: null,
     }
   }
 
-  // Loop video ended — replay (same state, caller will loop)
+  if (state.to === 'idle') {
+    return {
+      ...state,
+      clip: selectIdleLoopClip(),
+      cycle: state.cycle + 1,
+    }
+  }
+
   return state
 }
 
+export function shouldLoopPlayback(state: AnimationState): boolean {
+  return !state.isTransition && state.to !== 'idle'
+}
+
 export function videoKey(state: AnimationState): string {
-  return `${state.from}-to-${state.to}`
+  return `${state.cycle}:${state.clip}`
 }

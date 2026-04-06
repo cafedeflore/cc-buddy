@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
 import './PetWindow.css'
@@ -12,13 +12,14 @@ function PetWindow() {
   const [hovered, setHovered] = useState(false)
   const [visibleLabel, setVisibleLabel] = useState('')
   const [bubbleFading, setBubbleFading] = useState(false)
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null)
+  const suppressClickRef = useRef(false)
+  const dragTriggeredRef = useRef(false)
 
-  // Derive the current mood from the most active session
   const room = selectPrimaryRoom(snapshot?.rooms ?? [])
   const currentMood: PetMood = room?.petState.mood ?? 'idle'
   const label = room?.latestEvent?.detail ?? room?.petState.label ?? ''
 
-  // Auto-dismiss bubble after 3 seconds
   useEffect(() => {
     if (!label) {
       setVisibleLabel('')
@@ -37,7 +38,14 @@ function PetWindow() {
       clearTimeout(hideTimer)
     }
   }, [label])
-  const { videoRef, videoSrc, loop: shouldLoop, handleEnded } = usePetAnimation(currentMood)
+
+  const {
+    videoRef,
+    videoSrc,
+    loop: shouldLoop,
+    handleEnded,
+    triggerPetpet,
+  } = usePetAnimation(currentMood)
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
@@ -48,8 +56,43 @@ function PetWindow() {
       return
     }
 
+    dragStartRef.current = { x: e.clientX, y: e.clientY }
+    dragTriggeredRef.current = false
+    suppressClickRef.current = false
+  }, [])
+
+  const handleStageMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if ((e.buttons & 1) !== 1 || !dragStartRef.current || dragTriggeredRef.current) {
+      return
+    }
+
+    const deltaX = Math.abs(e.clientX - dragStartRef.current.x)
+    const deltaY = Math.abs(e.clientY - dragStartRef.current.y)
+    if (Math.max(deltaX, deltaY) < 8) {
+      return
+    }
+
+    dragTriggeredRef.current = true
+    suppressClickRef.current = true
     void getCurrentWindow().startDragging()
   }, [])
+
+  const handleStagePointerReset = useCallback(() => {
+    dragStartRef.current = null
+  }, [])
+
+  const handleStageClick = useCallback(() => {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false
+      return
+    }
+
+    if (currentMood !== 'idle') {
+      return
+    }
+
+    triggerPetpet()
+  }, [currentMood, triggerPetpet])
 
   return (
     <div
@@ -73,6 +116,10 @@ function PetWindow() {
           data-testid="pet-stage-square"
           data-tauri-drag-region
           onMouseDown={handleStageMouseDown}
+          onMouseMove={handleStageMouseMove}
+          onMouseUp={handleStagePointerReset}
+          onMouseLeave={handleStagePointerReset}
+          onClick={handleStageClick}
         >
           <div className="pet-circle-backdrop" data-testid="pet-circle-backdrop" />
           <video

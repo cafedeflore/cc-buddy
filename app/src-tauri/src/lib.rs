@@ -120,6 +120,14 @@ struct SavedWindowBounds {
     height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayWorkArea {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct PersistedWindowState {
@@ -148,6 +156,7 @@ type SharedWindowState = Arc<Mutex<WindowStateStore>>;
 
 const IDLE_AFTER_MS: i128 = 30 * 1000;
 const WINDOW_STATE_FILE_NAME: &str = "window-state.json";
+const HIDDEN_WINDOW_COORDINATE_THRESHOLD: i32 = -32000;
 
 pub fn run() {
     let runtime = match build_runtime() {
@@ -250,10 +259,14 @@ fn build_window_state_store(app: &AppHandle) -> WindowStateStore {
 }
 
 fn load_window_state(path: &Path) -> PersistedWindowState {
-    fs::read_to_string(path)
+    let mut state = fs::read_to_string(path)
         .ok()
         .and_then(|content| serde_json::from_str::<PersistedWindowState>(&content).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    state
+        .windows
+        .retain(|_, bounds| is_valid_window_bounds(bounds));
+    state
 }
 
 fn save_window_state(path: &Path, state: &PersistedWindowState) -> Result<(), String> {
@@ -290,6 +303,9 @@ fn update_window_bounds(
     let previous = next.clone();
 
     if let Some((x, y)) = position {
+        if x <= HIDDEN_WINDOW_COORDINATE_THRESHOLD || y <= HIDDEN_WINDOW_COORDINATE_THRESHOLD {
+            return false;
+        }
         next.x = x;
         next.y = y;
     }
@@ -307,6 +323,92 @@ fn update_window_bounds(
     true
 }
 
+fn is_valid_window_bounds(bounds: &SavedWindowBounds) -> bool {
+    bounds.x > HIDDEN_WINDOW_COORDINATE_THRESHOLD
+        && bounds.y > HIDDEN_WINDOW_COORDINATE_THRESHOLD
+        && bounds.width > 0
+        && bounds.height > 0
+}
+
+fn is_valid_display_work_area(work_area: &DisplayWorkArea) -> bool {
+    work_area.width > 0 && work_area.height > 0
+}
+
+fn display_work_area_from_monitor(monitor: &tauri::window::Monitor) -> DisplayWorkArea {
+    let work_area = monitor.work_area();
+    DisplayWorkArea {
+        x: work_area.position.x,
+        y: work_area.position.y,
+        width: work_area.size.width,
+        height: work_area.size.height,
+    }
+}
+
+fn is_window_bounds_visible_on_work_area(bounds: &SavedWindowBounds, work_area: DisplayWorkArea) -> bool {
+    let bounds_left = i64::from(bounds.x);
+    let bounds_top = i64::from(bounds.y);
+    let bounds_right = bounds_left + i64::from(bounds.width);
+    let bounds_bottom = bounds_top + i64::from(bounds.height);
+    let work_area_left = i64::from(work_area.x);
+    let work_area_top = i64::from(work_area.y);
+    let work_area_right = work_area_left + i64::from(work_area.width);
+    let work_area_bottom = work_area_top + i64::from(work_area.height);
+
+    bounds_left < work_area_right
+        && bounds_right > work_area_left
+        && bounds_top < work_area_bottom
+        && bounds_bottom > work_area_top
+}
+
+fn is_window_bounds_visible_on_any_work_area(
+    bounds: &SavedWindowBounds,
+    work_areas: &[DisplayWorkArea],
+) -> bool {
+    work_areas.iter().copied().filter(is_valid_display_work_area).any(|work_area| {
+        is_window_bounds_visible_on_work_area(bounds, work_area)
+    })
+}
+
+fn recenter_window_bounds_on_work_area(
+    bounds: &SavedWindowBounds,
+    work_area: DisplayWorkArea,
+) -> SavedWindowBounds {
+    let width = bounds.width.min(work_area.width);
+    let height = bounds.height.min(work_area.height);
+    let x = work_area.x + ((i64::from(work_area.width) - i64::from(width)) / 2) as i32;
+    let y = work_area.y + ((i64::from(work_area.height) - i64::from(height)) / 2) as i32;
+
+    SavedWindowBounds {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn resolve_restored_window_bounds(
+    bounds: &SavedWindowBounds,
+    work_areas: &[DisplayWorkArea],
+    primary_work_area: Option<DisplayWorkArea>,
+) -> SavedWindowBounds {
+    if is_window_bounds_visible_on_any_work_area(bounds, work_areas) {
+        return bounds.clone();
+    }
+
+    let fallback_work_area = primary_work_area
+        .filter(is_valid_display_work_area)
+        .or_else(|| {
+            work_areas
+                .iter()
+                .copied()
+                .find(is_valid_display_work_area)
+        });
+
+    fallback_work_area
+        .map(|work_area| recenter_window_bounds_on_work_area(bounds, work_area))
+        .unwrap_or_else(|| bounds.clone())
+}
+
 fn initialize_window_state_tracking(window: &WebviewWindow, store: &SharedWindowState) {
     if let Ok(guard) = store.lock() {
         restore_window_bounds(window, &guard.state);
@@ -320,9 +422,30 @@ fn restore_window_bounds(window: &WebviewWindow, state: &PersistedWindowState) {
     let Some(bounds) = state.windows.get(window.label()) else {
         return;
     };
+    if !is_valid_window_bounds(bounds) {
+        return;
+    }
 
-    let _ = window.set_position(PhysicalPosition::new(bounds.x, bounds.y));
-    let _ = window.set_size(PhysicalSize::new(bounds.width, bounds.height));
+    let work_areas = window
+        .available_monitors()
+        .ok()
+        .map(|monitors| {
+            monitors
+                .iter()
+                .map(display_work_area_from_monitor)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let primary_work_area = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(display_work_area_from_monitor);
+    let restored_bounds = resolve_restored_window_bounds(bounds, &work_areas, primary_work_area);
+
+    let _ = window.set_size(PhysicalSize::new(restored_bounds.width, restored_bounds.height));
+    let _ = window.set_position(PhysicalPosition::new(restored_bounds.x, restored_bounds.y));
 }
 
 fn sync_window_bounds(window: &WebviewWindow, store: &SharedWindowState) {
@@ -1164,5 +1287,138 @@ mod tests {
         assert_eq!(state.windows.len(), 2);
         assert_eq!(state.windows["pet"].x, 10);
         assert_eq!(state.windows["dashboard"].x, 30);
+    }
+
+    #[test]
+    fn update_window_bounds_ignores_hidden_window_coordinates() {
+        let mut state = PersistedWindowState::default();
+
+        assert!(update_window_bounds(
+            &mut state,
+            "pet",
+            Some((120, 48)),
+            Some((512, 512)),
+        ));
+        assert!(!update_window_bounds(
+            &mut state,
+            "pet",
+            Some((-32000, -32000)),
+            None,
+        ));
+
+        assert_eq!(
+            state.windows.get("pet"),
+            Some(&SavedWindowBounds {
+                x: 120,
+                y: 48,
+                width: 512,
+                height: 512,
+            })
+        );
+    }
+
+    #[test]
+    fn restore_window_bounds_keeps_visible_secondary_monitor_positions() {
+        let bounds = SavedWindowBounds {
+            x: -1800,
+            y: 120,
+            width: 512,
+            height: 512,
+        };
+        let work_areas = vec![
+            DisplayWorkArea {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1040,
+            },
+            DisplayWorkArea {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1040,
+            },
+        ];
+
+        assert_eq!(
+            resolve_restored_window_bounds(&bounds, &work_areas, Some(work_areas[0])),
+            bounds
+        );
+    }
+
+    #[test]
+    fn restore_window_bounds_recenters_offscreen_windows_on_primary_monitor() {
+        let bounds = SavedWindowBounds {
+            x: 2800,
+            y: 200,
+            width: 512,
+            height: 512,
+        };
+        let work_areas = vec![DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        }];
+
+        assert_eq!(
+            resolve_restored_window_bounds(&bounds, &work_areas, Some(work_areas[0])),
+            SavedWindowBounds {
+                x: 704,
+                y: 264,
+                width: 512,
+                height: 512,
+            }
+        );
+    }
+
+    #[test]
+    fn restore_window_bounds_clamps_oversized_windows_to_primary_monitor() {
+        let bounds = SavedWindowBounds {
+            x: 2800,
+            y: 200,
+            width: 2400,
+            height: 1400,
+        };
+        let work_areas = vec![DisplayWorkArea {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        }];
+
+        assert_eq!(
+            resolve_restored_window_bounds(&bounds, &work_areas, Some(work_areas[0])),
+            SavedWindowBounds {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1040,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_saved_window_bounds_are_treated_as_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        fs::write(
+            &path,
+            r#"{
+  "windows": {
+    "pet": {
+      "x": -32000,
+      "y": -32000,
+      "width": 314,
+      "height": 50
+    }
+  }
+}"#,
+        )
+        .expect("write");
+
+        let state = load_window_state(&path);
+
+        assert!(state.windows.is_empty());
     }
 }
