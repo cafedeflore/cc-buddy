@@ -1,9 +1,10 @@
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import { resolve } from 'path'
-import { existsSync, createReadStream, statSync } from 'fs'
+import { cpSync, existsSync, createReadStream, mkdirSync, statSync } from 'fs'
 
-// Serve src-tauri/resources/videos/* at /videos/* in dev mode
+// Serve src-tauri/resources/videos/* at /videos/* in dev mode,
+// and copy the same files into dist/videos for packaged builds.
 function serveResourceVideos() {
   const videosDir = resolve(__dirname, 'src-tauri/resources/videos')
   return {
@@ -17,6 +18,11 @@ function serveResourceVideos() {
         res.setHeader('Content-Length', statSync(filePath).size)
         createReadStream(filePath).pipe(res as any)
       })
+    },
+    closeBundle() {
+      const distVideosDir = resolve(__dirname, 'dist/videos')
+      mkdirSync(distVideosDir, { recursive: true })
+      cpSync(videosDir, distVideosDir, { recursive: true, force: true })
     },
   }
 }
