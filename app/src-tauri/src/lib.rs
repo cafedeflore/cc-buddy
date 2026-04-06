@@ -11,7 +11,12 @@ use std::{
 use dirs::home_dir;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow,
+    WindowEvent,
+    menu::{Menu, MenuItem},
+    tray::TrayIconBuilder,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +111,27 @@ struct TailState {
     remainder: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SavedWindowBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PersistedWindowState {
+    windows: HashMap<String, SavedWindowBounds>,
+}
+
+#[derive(Debug, Clone)]
+struct WindowStateStore {
+    path: Option<PathBuf>,
+    state: PersistedWindowState,
+}
+
 #[derive(Debug, Clone)]
 struct MonitorRuntime {
     claude_root: PathBuf,
@@ -118,8 +144,10 @@ struct MonitorRuntime {
 }
 
 type SharedMonitorState = Arc<Mutex<MonitorRuntime>>;
+type SharedWindowState = Arc<Mutex<WindowStateStore>>;
 
-const IDLE_AFTER_MS: i128 = 2 * 60 * 1000;
+const IDLE_AFTER_MS: i128 = 30 * 1000;
+const WINDOW_STATE_FILE_NAME: &str = "window-state.json";
 
 pub fn run() {
     let runtime = match build_runtime() {
@@ -128,8 +156,46 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("pet") {
+                let _ = window.set_focus();
+            }
+        }))
         .manage(runtime.clone())
         .setup(move |app| {
+            let window_state = Arc::new(Mutex::new(build_window_state_store(&app.handle())));
+
+            // System tray
+            let dashboard_item = MenuItem::with_id(app, "dashboard", "Dashboard", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&dashboard_item, &quit_item])?;
+
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().cloned().unwrap())
+                .menu(&tray_menu)
+                .tooltip("CC Buddy")
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "dashboard" => {
+                        let _ = toggle_dashboard(app.clone());
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            if let Some(pet_window) = app.get_webview_window("pet") {
+                let _ = pet_window.set_skip_taskbar(true);
+                initialize_window_state_tracking(&pet_window, &window_state);
+
+                // Make the pet window's webview truly transparent on Windows.
+                let _ = pet_window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
+            }
+            if let Some(dashboard_window) = app.get_webview_window("dashboard") {
+                initialize_window_state_tracking(&dashboard_window, &window_state);
+            }
+
             emit_snapshot(&app.handle(), &runtime);
             emit_delta(
                 &app.handle(),
@@ -143,7 +209,7 @@ pub fn run() {
             spawn_monitor_watcher(app.handle().clone(), runtime.clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![monitor_snapshot])
+        .invoke_handler(tauri::generate_handler![monitor_snapshot, toggle_dashboard])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -154,6 +220,163 @@ fn monitor_snapshot(state: State<'_, SharedMonitorState>) -> Result<MonitorSnaps
         .lock()
         .map_err(|_| "Monitor state lock poisoned".to_string())?;
     snapshot_from_runtime(&runtime)
+}
+
+#[tauri::command]
+fn toggle_dashboard(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("dashboard") {
+        if window.is_visible().unwrap_or(false) {
+            window.hide().map_err(|e| e.to_string())?;
+        } else {
+            window.show().map_err(|e| e.to_string())?;
+            window.set_focus().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn build_window_state_store(app: &AppHandle) -> WindowStateStore {
+    let path = app
+        .path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(WINDOW_STATE_FILE_NAME));
+    let state = path
+        .as_deref()
+        .map(load_window_state)
+        .unwrap_or_default();
+
+    WindowStateStore { path, state }
+}
+
+fn load_window_state(path: &Path) -> PersistedWindowState {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<PersistedWindowState>(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_window_state(path: &Path, state: &PersistedWindowState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
+    }
+
+    let content =
+        serde_json::to_string_pretty(state).map_err(|error| format!("Unable to serialize window state: {error}"))?;
+    fs::write(path, content).map_err(|error| format!("Unable to write {}: {error}", path.display()))
+}
+
+fn update_window_bounds(
+    state: &mut PersistedWindowState,
+    label: &str,
+    position: Option<(i32, i32)>,
+    size: Option<(u32, u32)>,
+) -> bool {
+    if position.is_none() && size.is_none() {
+        return false;
+    }
+
+    let mut next = state
+        .windows
+        .get(label)
+        .cloned()
+        .unwrap_or(SavedWindowBounds {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        });
+    let previous = next.clone();
+
+    if let Some((x, y)) = position {
+        next.x = x;
+        next.y = y;
+    }
+
+    if let Some((width, height)) = size {
+        next.width = width;
+        next.height = height;
+    }
+
+    if next == previous {
+        return false;
+    }
+
+    state.windows.insert(label.to_string(), next);
+    true
+}
+
+fn initialize_window_state_tracking(window: &WebviewWindow, store: &SharedWindowState) {
+    if let Ok(guard) = store.lock() {
+        restore_window_bounds(window, &guard.state);
+    }
+
+    sync_window_bounds(window, store);
+    attach_window_state_tracking(window, store.clone());
+}
+
+fn restore_window_bounds(window: &WebviewWindow, state: &PersistedWindowState) {
+    let Some(bounds) = state.windows.get(window.label()) else {
+        return;
+    };
+
+    let _ = window.set_position(PhysicalPosition::new(bounds.x, bounds.y));
+    let _ = window.set_size(PhysicalSize::new(bounds.width, bounds.height));
+}
+
+fn sync_window_bounds(window: &WebviewWindow, store: &SharedWindowState) {
+    let Ok(position) = window.outer_position() else {
+        return;
+    };
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+
+    persist_window_bounds(
+        store,
+        window.label(),
+        Some((position.x, position.y)),
+        Some((size.width, size.height)),
+    );
+}
+
+fn attach_window_state_tracking(window: &WebviewWindow, store: SharedWindowState) {
+    let label = window.label().to_string();
+    window.on_window_event(move |event| match event {
+        WindowEvent::Moved(position) => {
+            persist_window_bounds(&store, &label, Some((position.x, position.y)), None);
+        }
+        WindowEvent::Resized(size) => {
+            persist_window_bounds(&store, &label, None, Some((size.width, size.height)));
+        }
+        _ => {}
+    });
+}
+
+fn persist_window_bounds(
+    store: &SharedWindowState,
+    label: &str,
+    position: Option<(i32, i32)>,
+    size: Option<(u32, u32)>,
+) {
+    let pending_write = match store.lock() {
+        Ok(mut guard) => {
+            if !update_window_bounds(&mut guard.state, label, position, size) {
+                return;
+            }
+
+            guard
+                .path
+                .clone()
+                .map(|path| (path, guard.state.clone()))
+        }
+        Err(_) => return,
+    };
+
+    if let Some((path, state)) = pending_write {
+        let _ = save_window_state(&path, &state);
+    }
 }
 
 fn build_runtime() -> Result<MonitorRuntime, String> {
@@ -832,5 +1055,114 @@ mod tests {
 
         assert_eq!(pet_state.mood, "idle");
         assert_eq!(pet_state.action, "sleeping");
+    }
+
+    #[test]
+    fn infer_pet_state_returns_idle_after_30_seconds() {
+        let event = ConversationEvent {
+            event_type: "assistant".into(),
+            timestamp: "2026-04-04T00:00:00.000Z".into(),
+            tool_name: None,
+            detail: None,
+        };
+
+        let session = SessionSnapshot {
+            session_id: "session-1".into(),
+            cwd: "D:\\repo\\cc-buddy".into(),
+            pid: 1,
+            alive: true,
+            started_at: "2026-04-04T00:00:00.000Z".into(),
+            updated_at: "2026-04-04T00:00:00.000Z".into(),
+        };
+
+        let pet_state = infer_pet_state(&session, Some(&event), "2026-04-04T00:00:31.000Z");
+
+        assert_eq!(pet_state.mood, "idle");
+        assert_eq!(pet_state.action, "sleeping");
+    }
+
+    #[test]
+    fn loads_empty_window_state_when_file_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = load_window_state(&temp.path().join("window-state.json"));
+
+        assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn saves_and_reloads_window_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedWindowState::default();
+
+        assert!(update_window_bounds(
+            &mut state,
+            "pet",
+            Some((120, 48)),
+            Some((512, 512)),
+        ));
+        save_window_state(&path, &state).expect("save");
+
+        let reloaded = load_window_state(&path);
+
+        assert_eq!(reloaded, state);
+    }
+
+    #[test]
+    fn update_window_bounds_preserves_existing_values_for_partial_updates() {
+        let mut state = PersistedWindowState::default();
+
+        assert!(update_window_bounds(
+            &mut state,
+            "dashboard",
+            Some((200, 180)),
+            Some((1360, 900)),
+        ));
+        assert!(update_window_bounds(
+            &mut state,
+            "dashboard",
+            None,
+            Some((1440, 920)),
+        ));
+
+        assert_eq!(
+            state.windows.get("dashboard"),
+            Some(&SavedWindowBounds {
+                x: 200,
+                y: 180,
+                width: 1440,
+                height: 920,
+            })
+        );
+    }
+
+    #[test]
+    fn update_window_bounds_returns_false_when_values_do_not_change() {
+        let mut state = PersistedWindowState::default();
+
+        assert!(update_window_bounds(
+            &mut state,
+            "pet",
+            Some((120, 48)),
+            Some((512, 512)),
+        ));
+        assert!(!update_window_bounds(
+            &mut state,
+            "pet",
+            Some((120, 48)),
+            Some((512, 512)),
+        ));
+    }
+
+    #[test]
+    fn window_state_updates_do_not_overwrite_other_windows() {
+        let mut state = PersistedWindowState::default();
+
+        update_window_bounds(&mut state, "pet", Some((10, 20)), Some((512, 512)));
+        update_window_bounds(&mut state, "dashboard", Some((30, 40)), Some((1360, 900)));
+
+        assert_eq!(state.windows.len(), 2);
+        assert_eq!(state.windows["pet"].x, 10);
+        assert_eq!(state.windows["dashboard"].x, 30);
     }
 }

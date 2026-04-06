@@ -1,107 +1,152 @@
-# CC Buddy 框架说明
+# CC Buddy 架构说明
 
 ## 1. 项目目标
 
-CC Buddy 是一个基于 Tauri 的桌面监控应用，用来被动观察本地 Claude Code 运行状态，并把会话活跃度、工具使用情况、伴侣信息映射成“桌宠”视图。它的设计重点不是控制 Claude Code，而是只读采集、实时推断和低打扰展示。
+CC Buddy 是一个基于 Tauri 的桌面监控应用，用来被动观察本地 Claude Code 的运行状态，并把会话活跃度、工具使用情况、伴侣信息映射成“桌宠”视图。
 
-当前版本解决的是三个核心问题：
+它的目标不是控制 Claude Code，而是：
 
-1. 从本地文件系统发现正在运行的 Claude Code session。
-2. 从 session 的 JSONL 事件流里推断每个会话当前在做什么。
-3. 把这些状态以轻量、可持续刷新的桌面 UI 呈现出来。
+1. 只读采集本地状态。
+2. 实时推断当前会话行为。
+3. 用低打扰、常驻桌面的方式把这些状态展示出来。
 
-## 2. 总体架构
+当前版本主要解决三个问题：
+
+1. 从本地文件系统发现仍然活跃的 Claude Code session。
+2. 从 session 对应的 JSONL 事件流中推断“当前在做什么”。
+3. 把这些状态同时呈现为桌宠浮层窗口和仪表盘窗口。
+
+## 2. 运行形态
+
+应用当前有两个窗口：
+
+- `pet`：透明置顶的桌宠窗口，路由为 `/pet`
+- `dashboard`：普通层级的信息面板窗口，路由为 `/dashboard`
+
+窗口定义在 [`../app/src-tauri/tauri.conf.json`](../app/src-tauri/tauri.conf.json)。
+
+前端入口在 [`../app/src/main.tsx`](../app/src/main.tsx)。这里根据 `window.location.pathname` 在两个界面之间切换：
+
+- `/pet` -> 渲染 [`../app/src/PetWindow.tsx`](../app/src/PetWindow.tsx)
+- 其他路径 -> 渲染 [`../app/src/App.tsx`](../app/src/App.tsx)
+
+## 3. 总体架构
 
 整体采用 Tauri 的双层结构：
 
 - 前端：`React + TypeScript + Vite`
 - 桌面壳与本地能力：`Tauri + Rust`
 
-数据流是单向的：
+数据流保持单向：
 
 1. Rust 侧读取 `~/.claude/sessions`、`~/.claude/projects` 和 `.claude.json`
-2. Rust 侧构建运行时快照，并对变更做增量 tail
-3. Rust 侧通过 Tauri event 把 `snapshot` / `delta` 推给前端
-4. 前端合并状态并驱动桌宠场景、房间列表和事件 feed
+2. Rust 侧维护运行时状态，并增量消费 JSONL 变化
+3. Rust 侧通过 Tauri 事件把 `monitor-snapshot` / `monitor-delta` 推给前端
+4. 前端合并状态后，驱动 dashboard 与 pet window 的 UI
 
-## 3. 模块分层
+## 4. 前端分层
 
-### 3.1 前端展示层
+### 4.1 路由与窗口入口
 
-前端入口在 [`App.tsx`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/App.tsx)。
+[`../app/src/main.tsx`](../app/src/main.tsx) 负责：
 
-它负责三件事：
+- 根据 URL 决定进入 pet window 还是 dashboard
+- 在 `/pet` 时给根节点加上 `pet-mode`，让整棵 DOM 使用透明背景
 
-- 初始化首屏快照
-- 订阅 Rust 推送的增量事件
-- 把会话状态渲染成桌宠舞台、会话列表和事件 feed
+### 4.2 Dashboard 展示层
 
-前端没有文件系统访问能力，也不直接解析 Claude 原始文件；它只消费统一的数据模型。
+[`../app/src/App.tsx`](../app/src/App.tsx) 是仪表盘界面，负责：
 
-### 3.2 前端桥接层
+- 展示 companion 信息
+- 展示 Top 3 活跃 rooms
+- 展示 event feed
 
-桥接层位于 [`monitor.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/bridge/monitor.ts)。
+它消费的是统一的 `snapshot` 结构，不直接接触底层文件或 Tauri 细节。
 
-它屏蔽了两种运行环境差异：
+### 4.3 Pet Window 展示层
 
-- 在 Tauri 环境下，通过 `invoke + listen` 调用 Rust 命令和事件
-- 在普通浏览器开发环境下，退回到 demo/mock 数据，保证 UI 可以独立开发
+[`../app/src/PetWindow.tsx`](../app/src/PetWindow.tsx) 是桌宠浮层窗口，负责：
 
-这层的价值是把“桌面能力”与“界面逻辑”分离，前端组件不需要知道当前是在真实桌面应用里，还是纯 Vite 开发模式里。
+- 根据当前最活跃 room 选择宠物情绪和文案
+- 播放对应的 `.webm` 动画
+- 管理气泡淡入淡出
+- 提供悬停边框和窗口拖拽体验
 
-### 3.3 领域模型层
+当前宠物窗口布局规则为：
 
-领域模型集中在 `app/src/domain`：
+1. 上方保留约 `20%` 的气泡区域。
+2. 下方使用一个始终 `1:1` 的宠物舞台。
+3. 宠物舞台内部有一个约 `70%` 尺寸、轻微下移的白色径向渐隐圆形背景。
+4. 视频层覆盖在圆形背景之上，使用 `object-fit: contain` 保证宠物显示完整。
 
-- [`types.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/types.ts)：统一定义 `SessionSnapshot`、`ConversationEvent`、`MonitorSnapshot`、`MonitorDelta` 等模型
-- [`behavior.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/behavior.ts)：把事件类型映射成桌宠状态
-- [`jsonl.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/jsonl.ts)：前端侧 JSONL 解析工具与测试支撑
-- [`companion.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/companion.ts)：伴侣信息整理
-- [`monitor.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/monitor.ts)：快照构造与排序语义
-- [`monitorDelta.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/monitorDelta.ts)：前端增量合并逻辑
+这些样式定义在 [`../app/src/PetWindow.css`](../app/src/PetWindow.css)。
 
-这里定义的是“应用理解世界的方式”，而不是某个 UI 的实现细节，所以它可以被测试、复用，也方便后续替换展示形式。
+当前最活跃 room 的选择不是机械地固定取 `rooms[0]`，而是会根据 `latestEvent.timestamp` 和 `session.updatedAt` 重新比较活动时间，优先跟随最新活跃的 session，避免桌宠停留在旧 room 上。
 
-### 3.4 Rust 运行时层
+### 4.4 前端桥接层
 
-Rust 主体在 [`lib.rs`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src-tauri/src/lib.rs)。
+[`../app/src/bridge/monitor.ts`](../app/src/bridge/monitor.ts) 负责屏蔽运行环境差异：
+
+- 在 Tauri 环境下，通过 `invoke + listen` 调用 Rust 命令与事件
+- 在普通浏览器开发环境下，退回到 demo/mock 数据
+
+这样前端组件不需要知道当前是在真实桌面窗口里，还是在纯 Vite 页面里。
+
+### 4.5 Hooks 与领域模型
+
+前端逻辑主要分布在以下位置：
+
+- [`../app/src/hooks/useMonitorState.ts`](../app/src/hooks/useMonitorState.ts)：拉取初始快照并订阅 delta
+- [`../app/src/hooks/usePetAnimation.ts`](../app/src/hooks/usePetAnimation.ts)：驱动宠物动画状态机与视频切换
+- [`../app/src/domain/types.ts`](../app/src/domain/types.ts)：统一数据模型
+- [`../app/src/domain/behavior.ts`](../app/src/domain/behavior.ts)：行为到宠物状态的前端映射
+- [`../app/src/domain/companion.ts`](../app/src/domain/companion.ts)：伴侣信息整理
+- [`../app/src/domain/monitor.ts`](../app/src/domain/monitor.ts)：快照构造语义
+- [`../app/src/domain/monitorDelta.ts`](../app/src/domain/monitorDelta.ts)：增量合并逻辑
+- [`../app/src/domain/animationMachine.ts`](../app/src/domain/animationMachine.ts)：宠物动画切换状态机
+- [`../app/src/domain/videoPath.ts`](../app/src/domain/videoPath.ts)：动画资源路径解析
+
+## 5. Rust 运行时层
+
+Rust 主体在 [`../app/src-tauri/src/lib.rs`](../app/src-tauri/src/lib.rs)。
 
 它维护一个 `MonitorRuntime`，里面缓存：
 
 - 当前 companion 状态
 - 活跃 sessions
-- 每个 session 对应的日志路径
-- 每个日志文件的 tail offset 与 remainder
+- `sessionId -> logPath` 的映射
+- 每个日志文件的 `tail offset` 与 `remainder`
 - 每个 session 的最新事件
 
-可以把它理解成“应用内存中的真实状态树”。文件系统变化先进运行时，再由运行时统一生成快照或增量推送给前端。
+它可以理解为应用的“真实状态树”。
 
-## 4. 数据来源与职责边界
+文件系统变化先进入 `MonitorRuntime`，再由运行时统一产生：
 
-### 4.1 Session 元数据
+- `monitor-snapshot`：完整状态，用于初始化和兜底恢复
+- `monitor-delta`：局部变化，用于运行中的高频更新
+
+## 6. 数据来源与职责边界
+
+### 6.1 Session 元数据
 
 来源：`~/.claude/sessions/*.json`
 
 作用：
 
 - 发现有哪些 session 存在
-- 拿到 `pid`、`cwd`、`sessionId`、`startedAt`
-- 结合进程探测判断会话是否还活着
+- 读取 `pid`、`cwd`、`sessionId`、`startedAt`
+- 结合进程探测判断 session 是否仍然活跃
 
-Rust 侧会周期性/事件驱动地刷新这部分状态，并建立 `sessionId -> logPath` 的映射。
-
-### 4.2 会话事件流
+### 6.2 会话事件流
 
 来源：`~/.claude/projects/<slug>/<sessionId>.jsonl`
 
 作用：
 
-- 提供 assistant、tool_use、tool_result、result、error 等行为信号
-- 用于推断当前桌宠动作、情绪和说明文案
+- 提供 `assistant`、`tool_use`、`result`、`error` 等行为信号
+- 作为宠物情绪、动作、说明文案的核心推断来源
 
-这部分是状态判断的核心来源。
-
-### 4.3 Companion 信息
+### 6.3 Companion 信息
 
 来源：`.claude.json` 的 `companion` 字段
 
@@ -110,54 +155,47 @@ Rust 侧会周期性/事件驱动地刷新这部分状态，并建立 `sessionId
 - 同步宠物名字、性格、孵化时间
 - 计算 `ageDays`
 
-这部分不参与 session 活跃判断，但影响 UI 中“是谁在陪伴你”的展示语义。
+## 7. 实时更新机制
 
-## 5. 实时更新机制
+### 7.1 文件监听
 
-### 5.1 文件监听
-
-Rust 侧使用 `notify` 对以下位置建立监听：
+Rust 侧通过 `notify` 监听：
 
 - `~/.claude/sessions`
 - `~/.claude/projects`
 - 当前工作目录或用户目录下可命中的 `.claude.json`
 
-监听的目标不是“所有业务逻辑都靠轮询重扫”，而是尽量把变化变成局部刷新触发器。
+目标不是“定时整仓扫描”，而是把本地文件变化转成局部刷新信号。
 
-### 5.2 增量 JSONL tail
+### 7.2 增量 JSONL tail
 
-相比最初的“文件变化后整文件重读”，当前实现已经升级为增量 tail：
+相比整文件重读，当前实现已升级为增量 tail：
 
-- 每个日志文件维护 `offset`
-- 若文件新增内容，只读取新增字节
-- 若新增字节没有形成完整行，则把残片放进 `remainder`
-- 下一次再和新字节拼接解析
+- 每个 JSONL 文件维护 `offset`
+- 只读取新增字节
+- 不完整尾行进入 `remainder`
+- 下一次读取时继续拼接解析
 
-这样可以显著减少长会话日志的重复读取成本，也更接近真正事件流的语义。
+这样可以明显减少长会话日志的重复读取成本。
 
-### 5.3 Snapshot 与 Delta
+### 7.3 Snapshot 与 Delta 协同
 
-当前通信分成两类：
+前端首次进入时先获取完整快照，之后主要消费 delta，并通过 [`../app/src/domain/monitorDelta.ts`](../app/src/domain/monitorDelta.ts) 合并到当前状态。
 
-- `monitor-snapshot`：完整状态，适合初始化和兜底恢复
-- `monitor-delta`：只推送变化片段，适合运行中的高频更新
-
-前端首次进入时先拿完整快照，之后主要消费 delta，并通过 [`monitorDelta.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/monitorDelta.ts) 合并到当前状态。
-
-这个设计的好处是：
+这种设计的收益是：
 
 - 首屏稳定
 - 持续更新成本更低
-- 前后端协议更清晰，后续扩展字段时不需要每次都整包替换
+- 前后端协议更清晰
 
-## 6. 行为推断规则
+## 8. 行为推断与动画语义
 
-行为推断在前后端都保持同一套语义，核心规则在：
+前后端保持同一套行为语义：
 
-- 前端：[`behavior.ts`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src/domain/behavior.ts)
-- Rust：[`lib.rs`](D:/repo/cc-buddy/.worktrees/pet-monitor/app/src-tauri/src/lib.rs)
+- 前端规则在 [`../app/src/domain/behavior.ts`](../app/src/domain/behavior.ts)
+- Rust 规则在 [`../app/src-tauri/src/lib.rs`](../app/src-tauri/src/lib.rs)
 
-映射大致如下：
+当前核心映射大致如下：
 
 - `assistant` -> `thinking / pondering`
 - `tool_use + Bash` -> `excited / running_command`
@@ -168,68 +206,129 @@ Rust 侧使用 `notify` 对以下位置建立监听：
 - `result` -> `happy / celebrating`
 - `error` -> `worried / debugging`
 
-另外，当前已经加入“陈旧事件回落 idle”的判定：
+同时还包含“陈旧事件回落 idle”的规则：
 
-- 如果最近事件或会话更新时间超过 2 分钟没有变化
-- 即使之前最后一条事件是 `thinking` 或 `writing_code`
+- 如果最近事件或会话更新时间超过 30 秒无变化
+- 即使最后一次是 `thinking` 或 `writing_code`
 - 也会回落为 `idle / sleeping`
 
-这样可以避免旧事件把已经空闲的 session 长时间误判成活跃状态。
+在 pet window 中，情绪切换并不是直接替换静态资源，而是通过 [`../app/src/domain/animationMachine.ts`](../app/src/domain/animationMachine.ts) 和 [`../app/src/hooks/usePetAnimation.ts`](../app/src/hooks/usePetAnimation.ts) 驱动 `from -> to` 的 `.webm` 动画过渡。
 
-## 7. UI 组织方式
+## 9. Pet Window 交互约定
 
-前端界面目前分成三块：
+当前桌宠窗口除展示外，还承担基础桌面交互：
 
-1. Hero 区：展示 companion 身份、活跃 session 数、桌宠舞台
-2. Live rooms：展示按最新时间排序后的前三个 session
-3. Event feed：展示当前最新事件摘要
+### 9.1 悬停边框
 
-其中“桌宠舞台”和“房间列表”消费的是同一份 session room 数据，只是表现形式不同。这样做可以保证：
+当鼠标移入 pet window 时，窗口外围会显示一圈高亮边框，方便用户识别透明窗口边缘并做窗口大小调整。
 
-- 视觉层和信息层保持一致
-- 改动排序规则时不会出现不同区域展示不一致
+实现位置：
 
-## 8. 调试与开发方式
+- 结构：[`../app/src/PetWindow.tsx`](../app/src/PetWindow.tsx)
+- 样式：[`../app/src/PetWindow.css`](../app/src/PetWindow.css)
 
-推荐的本地开发方式：
+### 9.2 窗口拖拽
+
+当前拖拽采用双保险：
+
+1. 容器层保留 `data-tauri-drag-region`
+2. 中间宠物舞台在左键按下时显式调用 `getCurrentWindow().startDragging()`
+
+这样可以避免点击落在内部舞台层时，透明窗口因为事件命中层级不同而拖不动。
+
+对应实现位于 [`../app/src/PetWindow.tsx`](../app/src/PetWindow.tsx)。
+
+### 9.3 气泡文案来源
+
+宠物气泡文案与 dashboard 中 live room 列表每一行最右侧的说明文案保持同源，优先使用：
+
+`room.latestEvent?.detail ?? room.petState.label`
+
+这意味着：
+
+- 如果 room 有最新事件描述，气泡直接显示该事件摘要
+- 如果没有事件摘要，才回退到宠物状态文案
+
+这样 pet window 和 dashboard 在“当前 room 正在做什么”的表述上能保持一致。
+
+## 10. 调试与开发方式
+
+### 10.1 整体联调
+
+推荐的整体联调命令是：
 
 ```powershell
-cd D:\repo\cc-buddy\app
+Set-Location D:\repo\cc-buddy\app
 npm run tauri:dev
 ```
 
-常用验证命令：
+这会同时启动：
+
+- Vite 前端开发服务
+- Tauri 桌面应用壳
+- 真实的 `pet` / `dashboard` 窗口
+
+适合调试完整链路，包括：
+
+- Rust 文件监听
+- snapshot / delta 推送
+- 宠物动画与窗口交互
+
+### 10.2 仅前端调试
 
 ```powershell
+Set-Location D:\repo\cc-buddy\app
+npm run dev
+```
+
+适合只调 UI，不依赖真实 Tauri 环境时使用。
+
+### 10.3 常用验证命令
+
+前端验证：
+
+```powershell
+Set-Location D:\repo\cc-buddy\app
 npm test
 npm run lint
 npm run build
+```
+
+Rust 验证：
+
+```powershell
+Set-Location D:\repo\cc-buddy\app\src-tauri
 cargo.exe test
 ```
 
-其中：
+### 10.4 文档维护说明
 
-- `npm run dev` 适合只调前端
-- `npm run tauri:dev` 适合联调前后端和真实监听
-- `cargo.exe test` 适合单独验证 Rust 的监听、tail 与推断逻辑
+当前仓库没有“调试结束后自动写回 `docs/`”的脚本。
 
-## 9. 当前设计的优点与限制
+也就是说：
+
+- `npm run tauri:dev` 只负责启动联调
+- `docs/architecture-cn.md` 需要在架构或交互发生变化后手动更新
+
+## 11. 当前设计的优点与限制
 
 ### 优点
 
 - 纯只读集成，不侵入 Claude Code
 - 前后端职责清晰，UI 可脱离真实数据独立开发
 - Rust 侧已具备增量 tail 与事件推送能力
-- 状态模型统一，便于后续加更多视觉表现
+- Pet window 与 dashboard 共享统一数据模型
+- 宠物窗口已具备透明浮层、拖拽和边界提示能力
+- dashboard 不再强制置顶，更符合普通信息面板的桌面使用习惯
 
 ### 限制
 
-- 当前 `activeCount` 语义仍偏向“当前展示中的活跃房间数”，不是完整 session 总量统计
+- 当前 `activeCount` 更偏向“当前展示中的活跃房间数”，不是完整 session 总量统计
 - watcher 仍以目录级监听为主，还可以进一步收窄到命中的 session log
 - 现在推的是“结构化状态变化”，还没细化到更低层级的动画事件
 - idle 阈值目前是固定值，后续可以配置化
 
-## 10. 后续演进建议
+## 12. 后续演进建议
 
 后续可以按下面方向继续演进：
 
@@ -237,7 +336,7 @@ cargo.exe test
 2. 把 watcher 收窄到已命中的 session 日志文件，减少无关目录噪音。
 3. 在 delta 之上再增加更细粒度的动画事件，让桌宠动作更自然。
 4. 把 idle 时间阈值做成可配置项。
-5. 继续补透明置顶窗口、点击穿透、托盘控制等完整桌面体验。
+5. 继续补点击穿透、托盘控制和更完整的透明窗口交互策略。
 
 这份架构的核心思想可以概括为一句话：
 

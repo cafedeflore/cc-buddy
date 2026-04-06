@@ -1,6 +1,6 @@
 import type { ConversationEvent, PetState, SessionSnapshot } from './types'
 
-const IDLE_AFTER_MS = 2 * 60 * 1000
+const IDLE_AFTER_MS = 30 * 1000
 
 const idleState: PetState = {
   mood: 'idle',

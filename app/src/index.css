@@ -28,6 +28,17 @@ body {
   margin: 0;
 }
 
+/* Pet window: fully transparent background for the overlay */
+:root.pet-mode,
+:root.pet-mode body,
+:root.pet-mode #root {
+  background: transparent !important;
+}
+
+:root.pet-mode #root {
+  min-height: auto;
+}
+
 h1,
 h2 {
   font-family: var(--heading);

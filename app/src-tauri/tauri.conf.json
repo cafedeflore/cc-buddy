@@ -12,13 +12,30 @@
   "app": {
     "windows": [
       {
+        "label": "pet",
         "title": "CC Buddy",
+        "width": 512,
+        "height": 512,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "url": "/pet"
+      },
+      {
+        "label": "dashboard",
+        "title": "CC Buddy Dashboard",
         "width": 1360,
         "height": 900,
         "resizable": true,
         "decorations": false,
         "transparent": true,
-        "alwaysOnTop": true
+        "shadow": false,
+        "alwaysOnTop": false,
+        "visible": false,
+        "url": "/dashboard"
       }
     ],
     "security": {
@@ -28,6 +45,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "resources": ["resources/videos/"]
   }
 }

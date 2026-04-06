@@ -77,4 +77,25 @@ describe('inferPetState', () => {
       intensity: 'low',
     })
   })
+
+  it('falls back to idle after 30 seconds of inactivity', () => {
+    expect(
+      inferPetState(
+        {
+          ...baseSession,
+          updatedAt: '2026-04-03T12:06:00.000Z',
+        },
+        {
+          type: 'assistant',
+          timestamp: '2026-04-03T12:06:00.000Z',
+        },
+        '2026-04-03T12:06:31.000Z',
+      ),
+    ).toEqual({
+      mood: 'idle',
+      action: 'sleeping',
+      label: 'Session is idle',
+      intensity: 'low',
+    })
+  })
 })
