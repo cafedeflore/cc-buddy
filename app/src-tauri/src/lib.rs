@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
     fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use dirs::home_dir;
@@ -120,7 +121,7 @@ struct SavedWindowBounds {
     height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DisplayWorkArea {
     x: i32,
     y: i32,
@@ -128,16 +129,26 @@ struct DisplayWorkArea {
     height: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayConfiguration {
+    work_areas: Vec<DisplayWorkArea>,
+    primary_work_area: Option<DisplayWorkArea>,
+    fingerprint: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct PersistedWindowState {
     windows: HashMap<String, SavedWindowBounds>,
+    #[serde(default)]
+    display_profiles: HashMap<String, HashMap<String, SavedWindowBounds>>,
 }
 
 #[derive(Debug, Clone)]
 struct WindowStateStore {
     path: Option<PathBuf>,
     state: PersistedWindowState,
+    current_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +227,7 @@ pub fn run() {
                 },
             );
             spawn_monitor_watcher(app.handle().clone(), runtime.clone());
+            spawn_display_watcher(app.handle().clone(), window_state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![monitor_snapshot, toggle_dashboard])
@@ -255,7 +267,11 @@ fn build_window_state_store(app: &AppHandle) -> WindowStateStore {
         .map(load_window_state)
         .unwrap_or_default();
 
-    WindowStateStore { path, state }
+    WindowStateStore {
+        path,
+        state,
+        current_fingerprint: None,
+    }
 }
 
 fn load_window_state(path: &Path) -> PersistedWindowState {
@@ -285,6 +301,7 @@ fn update_window_bounds(
     label: &str,
     position: Option<(i32, i32)>,
     size: Option<(u32, u32)>,
+    fingerprint: Option<&str>,
 ) -> bool {
     if position.is_none() && size.is_none() {
         return false;
@@ -319,8 +336,29 @@ fn update_window_bounds(
         return false;
     }
 
-    state.windows.insert(label.to_string(), next);
+    state.windows.insert(label.to_string(), next.clone());
+
+    if let Some(fp) = fingerprint {
+        let profile = state
+            .display_profiles
+            .entry(fp.to_string())
+            .or_default();
+        profile.insert(label.to_string(), next);
+        enforce_display_profile_limit(&mut state.display_profiles, 10);
+    }
+
     true
+}
+
+fn enforce_display_profile_limit(
+    profiles: &mut HashMap<String, HashMap<String, SavedWindowBounds>>,
+    max: usize,
+) {
+    while profiles.len() > max {
+        if let Some(key) = profiles.keys().next().cloned() {
+            profiles.remove(&key);
+        }
+    }
 }
 
 fn is_valid_window_bounds(bounds: &SavedWindowBounds) -> bool {
@@ -341,6 +379,39 @@ fn display_work_area_from_monitor(monitor: &tauri::window::Monitor) -> DisplayWo
         y: work_area.position.y,
         width: work_area.size.width,
         height: work_area.size.height,
+    }
+}
+
+fn display_configuration_fingerprint(work_areas: &[DisplayWorkArea]) -> String {
+    let mut sorted = work_areas.to_vec();
+    sorted.sort_by_key(|wa| (wa.x, wa.y, wa.width, wa.height));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sorted.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn capture_display_configuration(window: &WebviewWindow) -> DisplayConfiguration {
+    let work_areas = window
+        .available_monitors()
+        .ok()
+        .map(|monitors| {
+            monitors
+                .iter()
+                .map(display_work_area_from_monitor)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let primary_work_area = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(display_work_area_from_monitor);
+    let fingerprint = display_configuration_fingerprint(&work_areas);
+    DisplayConfiguration {
+        work_areas,
+        primary_work_area,
+        fingerprint,
     }
 }
 
@@ -410,39 +481,38 @@ fn resolve_restored_window_bounds(
 }
 
 fn initialize_window_state_tracking(window: &WebviewWindow, store: &SharedWindowState) {
-    if let Ok(guard) = store.lock() {
-        restore_window_bounds(window, &guard.state);
+    let config = capture_display_configuration(window);
+
+    if let Ok(mut guard) = store.lock() {
+        restore_window_bounds(window, &guard.state, &config);
+        guard.current_fingerprint = Some(config.fingerprint);
     }
 
     sync_window_bounds(window, store);
     attach_window_state_tracking(window, store.clone());
 }
 
-fn restore_window_bounds(window: &WebviewWindow, state: &PersistedWindowState) {
-    let Some(bounds) = state.windows.get(window.label()) else {
+fn restore_window_bounds(
+    window: &WebviewWindow,
+    state: &PersistedWindowState,
+    config: &DisplayConfiguration,
+) {
+    // Try display profile first, then fall back to global windows entry
+    let bounds = state
+        .display_profiles
+        .get(&config.fingerprint)
+        .and_then(|profile| profile.get(window.label()))
+        .or_else(|| state.windows.get(window.label()));
+
+    let Some(bounds) = bounds else {
         return;
     };
     if !is_valid_window_bounds(bounds) {
         return;
     }
 
-    let work_areas = window
-        .available_monitors()
-        .ok()
-        .map(|monitors| {
-            monitors
-                .iter()
-                .map(display_work_area_from_monitor)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let primary_work_area = window
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .as_ref()
-        .map(display_work_area_from_monitor);
-    let restored_bounds = resolve_restored_window_bounds(bounds, &work_areas, primary_work_area);
+    let restored_bounds =
+        resolve_restored_window_bounds(bounds, &config.work_areas, config.primary_work_area);
 
     let _ = window.set_size(PhysicalSize::new(restored_bounds.width, restored_bounds.height));
     let _ = window.set_position(PhysicalPosition::new(restored_bounds.x, restored_bounds.y));
@@ -485,7 +555,14 @@ fn persist_window_bounds(
 ) {
     let pending_write = match store.lock() {
         Ok(mut guard) => {
-            if !update_window_bounds(&mut guard.state, label, position, size) {
+            let fingerprint = guard.current_fingerprint.clone();
+            if !update_window_bounds(
+                &mut guard.state,
+                label,
+                position,
+                size,
+                fingerprint.as_deref(),
+            ) {
                 return;
             }
 
@@ -567,6 +644,99 @@ fn emit_snapshot(app: &AppHandle, runtime: &SharedMonitorState) {
 
 fn emit_delta(app: &AppHandle, delta: MonitorDelta) {
     let _ = app.emit("monitor-delta", delta);
+}
+
+fn revalidate_window_bounds(window: &WebviewWindow, store: &SharedWindowState, config: &DisplayConfiguration) {
+    if window.is_minimized().unwrap_or(false) || !window.is_visible().unwrap_or(true) {
+        return;
+    }
+
+    let Ok(position) = window.outer_position() else {
+        return;
+    };
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+
+    let current_bounds = SavedWindowBounds {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+
+    if !is_valid_window_bounds(&current_bounds) {
+        return;
+    }
+
+    // Check if we have a saved profile for the new display configuration
+    let profile_bounds = store
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .state
+                .display_profiles
+                .get(&config.fingerprint)
+                .and_then(|profile| profile.get(window.label()))
+                .cloned()
+        });
+
+    let target_bounds = if let Some(ref saved) = profile_bounds {
+        // Use saved profile position, but still validate visibility
+        resolve_restored_window_bounds(saved, &config.work_areas, config.primary_work_area)
+    } else if !is_window_bounds_visible_on_any_work_area(&current_bounds, &config.work_areas) {
+        // No profile and window is off-screen — recenter
+        resolve_restored_window_bounds(&current_bounds, &config.work_areas, config.primary_work_area)
+    } else {
+        // No profile but window is visible — leave it alone
+        return;
+    };
+
+    if target_bounds == current_bounds {
+        return;
+    }
+
+    let _ = window.set_size(PhysicalSize::new(target_bounds.width, target_bounds.height));
+    let _ = window.set_position(PhysicalPosition::new(target_bounds.x, target_bounds.y));
+    sync_window_bounds(window, store);
+}
+
+fn spawn_display_watcher(app: AppHandle, store: SharedWindowState) {
+    thread::spawn(move || {
+        let mut last_fingerprint: Option<String> = None;
+
+        loop {
+            thread::sleep(Duration::from_secs(2));
+
+            let Some(pet_window) = app.get_webview_window("pet") else {
+                continue;
+            };
+
+            let config = capture_display_configuration(&pet_window);
+
+            let changed = last_fingerprint.as_ref() != Some(&config.fingerprint);
+            if !changed {
+                continue;
+            }
+
+            // Update the stored fingerprint before revalidating
+            if let Ok(mut guard) = store.lock() {
+                guard.current_fingerprint = Some(config.fingerprint.clone());
+            }
+
+            last_fingerprint = Some(config.fingerprint.clone());
+
+            revalidate_window_bounds(&pet_window, &store, &config);
+
+            // Also revalidate dashboard if visible
+            if let Some(dashboard) = app.get_webview_window("dashboard") {
+                if dashboard.is_visible().unwrap_or(false) {
+                    revalidate_window_bounds(&dashboard, &store, &config);
+                }
+            }
+        }
+    });
 }
 
 fn spawn_monitor_watcher(app: AppHandle, runtime: SharedMonitorState) {
@@ -1223,6 +1393,7 @@ mod tests {
             "pet",
             Some((120, 48)),
             Some((512, 512)),
+            None,
         ));
         save_window_state(&path, &state).expect("save");
 
@@ -1240,12 +1411,14 @@ mod tests {
             "dashboard",
             Some((200, 180)),
             Some((1360, 900)),
+            None,
         ));
         assert!(update_window_bounds(
             &mut state,
             "dashboard",
             None,
             Some((1440, 920)),
+            None,
         ));
 
         assert_eq!(
@@ -1268,12 +1441,14 @@ mod tests {
             "pet",
             Some((120, 48)),
             Some((512, 512)),
+            None,
         ));
         assert!(!update_window_bounds(
             &mut state,
             "pet",
             Some((120, 48)),
             Some((512, 512)),
+            None,
         ));
     }
 
@@ -1281,8 +1456,8 @@ mod tests {
     fn window_state_updates_do_not_overwrite_other_windows() {
         let mut state = PersistedWindowState::default();
 
-        update_window_bounds(&mut state, "pet", Some((10, 20)), Some((512, 512)));
-        update_window_bounds(&mut state, "dashboard", Some((30, 40)), Some((1360, 900)));
+        update_window_bounds(&mut state, "pet", Some((10, 20)), Some((512, 512)), None);
+        update_window_bounds(&mut state, "dashboard", Some((30, 40)), Some((1360, 900)), None);
 
         assert_eq!(state.windows.len(), 2);
         assert_eq!(state.windows["pet"].x, 10);
@@ -1298,11 +1473,13 @@ mod tests {
             "pet",
             Some((120, 48)),
             Some((512, 512)),
+            None,
         ));
         assert!(!update_window_bounds(
             &mut state,
             "pet",
             Some((-32000, -32000)),
+            None,
             None,
         ));
 
@@ -1420,5 +1597,136 @@ mod tests {
         let state = load_window_state(&path);
 
         assert!(state.windows.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_is_stable_regardless_of_monitor_order() {
+        let wa1 = DisplayWorkArea { x: 0, y: 0, width: 1920, height: 1080 };
+        let wa2 = DisplayWorkArea { x: 1920, y: 0, width: 2560, height: 1440 };
+
+        let fp_a = display_configuration_fingerprint(&[wa1, wa2]);
+        let fp_b = display_configuration_fingerprint(&[wa2, wa1]);
+
+        assert_eq!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn fingerprint_differs_when_monitors_change() {
+        let single = vec![DisplayWorkArea { x: 0, y: 0, width: 1920, height: 1080 }];
+        let dual = vec![
+            DisplayWorkArea { x: 0, y: 0, width: 1920, height: 1080 },
+            DisplayWorkArea { x: 1920, y: 0, width: 2560, height: 1440 },
+        ];
+
+        assert_ne!(
+            display_configuration_fingerprint(&single),
+            display_configuration_fingerprint(&dual),
+        );
+    }
+
+    #[test]
+    fn update_window_bounds_writes_to_display_profile() {
+        let mut state = PersistedWindowState::default();
+
+        update_window_bounds(&mut state, "pet", Some((100, 200)), Some((512, 512)), Some("fp1"));
+
+        assert_eq!(
+            state.display_profiles.get("fp1").and_then(|p| p.get("pet")),
+            Some(&SavedWindowBounds { x: 100, y: 200, width: 512, height: 512 }),
+        );
+    }
+
+    #[test]
+    fn display_profile_limit_is_enforced() {
+        let mut profiles = HashMap::new();
+        for i in 0..12 {
+            let mut windows = HashMap::new();
+            windows.insert("pet".to_string(), SavedWindowBounds { x: i, y: 0, width: 512, height: 512 });
+            profiles.insert(format!("fp{i}"), windows);
+        }
+
+        enforce_display_profile_limit(&mut profiles, 10);
+
+        assert!(profiles.len() <= 10);
+    }
+
+    #[test]
+    fn backward_compatible_with_old_window_state_format() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        fs::write(
+            &path,
+            r#"{ "windows": { "pet": { "x": 100, "y": 200, "width": 512, "height": 512 } } }"#,
+        )
+        .expect("write");
+
+        let state = load_window_state(&path);
+
+        assert_eq!(state.windows.len(), 1);
+        assert!(state.display_profiles.is_empty());
+    }
+
+    #[test]
+    fn resolve_uses_profile_bounds_when_visible() {
+        let mut state = PersistedWindowState::default();
+        let mut profile = HashMap::new();
+        profile.insert(
+            "pet".to_string(),
+            SavedWindowBounds { x: 1920, y: 100, width: 512, height: 512 },
+        );
+        state.display_profiles.insert("dual_fp".to_string(), profile);
+        state.windows.insert(
+            "pet".to_string(),
+            SavedWindowBounds { x: 100, y: 200, width: 512, height: 512 },
+        );
+
+        let config = DisplayConfiguration {
+            work_areas: vec![
+                DisplayWorkArea { x: 0, y: 0, width: 1920, height: 1080 },
+                DisplayWorkArea { x: 1920, y: 0, width: 2560, height: 1440 },
+            ],
+            primary_work_area: Some(DisplayWorkArea { x: 0, y: 0, width: 1920, height: 1080 }),
+            fingerprint: "dual_fp".to_string(),
+        };
+
+        // Profile bounds should be preferred
+        let bounds = state
+            .display_profiles
+            .get(&config.fingerprint)
+            .and_then(|p| p.get("pet"))
+            .unwrap();
+        let restored = resolve_restored_window_bounds(bounds, &config.work_areas, config.primary_work_area);
+
+        assert_eq!(restored, SavedWindowBounds { x: 1920, y: 100, width: 512, height: 512 });
+    }
+
+    #[test]
+    fn resolve_recenters_when_profile_bounds_are_offscreen() {
+        let mut state = PersistedWindowState::default();
+        let mut profile = HashMap::new();
+        // This was on a second monitor that is now disconnected
+        profile.insert(
+            "pet".to_string(),
+            SavedWindowBounds { x: 1920, y: 100, width: 512, height: 512 },
+        );
+        state.display_profiles.insert("single_fp".to_string(), profile);
+
+        let config = DisplayConfiguration {
+            work_areas: vec![
+                DisplayWorkArea { x: 0, y: 0, width: 1920, height: 1080 },
+            ],
+            primary_work_area: Some(DisplayWorkArea { x: 0, y: 0, width: 1920, height: 1080 }),
+            fingerprint: "single_fp".to_string(),
+        };
+
+        let bounds = state
+            .display_profiles
+            .get(&config.fingerprint)
+            .and_then(|p| p.get("pet"))
+            .unwrap();
+        let restored = resolve_restored_window_bounds(bounds, &config.work_areas, config.primary_work_area);
+
+        // Should be recentered on the primary monitor, not left at x=1920
+        assert_eq!(restored, SavedWindowBounds { x: 704, y: 284, width: 512, height: 512 });
     }
 }
